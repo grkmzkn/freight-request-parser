@@ -63,7 +63,7 @@ def parse_freight_email(email_content: str) -> dict:
 2. Bir bilgi çıkarılamıyorsa değerine null veya "belirtilmemiş" yaz.
 3. JSON anahtarları şunlar olmalıdır: "is_turu", "tarih", "romork_cinsi", "sicaklik_araligi", "adr_sinifi", "gtip_kodlari", "yuk_turu", "tonaj", "kalkis_noktasi", "varis_noktasi", "yukleme_tipi", "talep_durumu", "rota_notu".
 
-Mektup/E-posta içeriği:
+E-posta içeriği:
 {email_content}
 """
 
