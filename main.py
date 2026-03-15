@@ -2,18 +2,23 @@ import json
 import ollama
 import os
 from dotenv import load_dotenv
-import google.generativeai as genai
 
+try:
+    import google.generativeai as genai
+except ImportError:
+    pass # If online is selected and it's not installed, we'll raise an error below.
+
+# Load environment variables from .env file
 load_dotenv()
 
-# 'offline' or 'online'
-LLM_TYPE = "offline"
+# Select the operating mode here: 'offline' or 'online'
+LLM_TYPE = "online" # "offline" runs the local Ollama model, "online" runs the Gemini model.
 
 OLLAMA_MODEL = "qwen2.5:3b"
 GOOGLE_MODEL = "gemini-2.5-flash"
 
 def parse_with_ollama(prompt: str, system_prompt: str, model_name: str) -> str:
-    """Ollama ile çıkarım yapar ve metni döner."""
+    """Performs inference using Ollama and returns the text."""
     response = ollama.chat(
         model=model_name,
         messages=[
@@ -25,9 +30,13 @@ def parse_with_ollama(prompt: str, system_prompt: str, model_name: str) -> str:
     return response['message']['content']
 
 def parse_with_google(prompt: str, system_prompt: str, model_name: str, api_key: str) -> str:
-    """Google Gemini ile çıkarım yapar ve metni döner."""
+    """Performs inference using Google Gemini and returns the text."""
+    if 'genai' not in globals():
+        raise ImportError("google-generativeai library is not installed. Run 'pip install google-generativeai'.")
+    
     genai.configure(api_key=api_key)
     
+    # System instruction can be provided in Gemini models
     model = genai.GenerativeModel(
         model_name=model_name,
         system_instruction=system_prompt,
@@ -39,8 +48,8 @@ def parse_with_google(prompt: str, system_prompt: str, model_name: str, api_key:
 
 def parse_freight_email(email_content: str) -> dict:
     """
-    Verilen mail metninden istenilen nakliye bilgilerini çıkarır ve JSON formatında döner.
-    LLM sağlayıcısını LLM_TYPE değişkeninden belirler.
+    Extracts the requested freight information from the given email text and returns it in JSON format.
+    Determines the LLM provider based on the LLM_TYPE variable.
     """
     
     prompt = f"""Aşağıdaki e-posta içeriğinden lojistik ve nakliye bilgilerini analiz ederek JSON formatında çıkar:
@@ -61,7 +70,7 @@ def parse_freight_email(email_content: str) -> dict:
 ÖNEMLİ KURALLAR:
 1. SADECE geçerli bir JSON objesi döndür. Ekstra metin, ```json veya açıklama OLMASIN.
 2. Bir bilgi çıkarılamıyorsa değerine null veya "belirtilmemiş" yaz.
-3. JSON anahtarları şunlar olmalıdır: "is_turu", "tarih", "romork_cinsi", "sicaklik_araligi", "adr_sinifi", "gtip_kodlari", "yuk_turu", "tonaj", "kalkis_noktasi", "varis_noktasi", "yukleme_tipi", "talep_durumu", "rota_notu".
+3. JSON anahtarları tam olarak şunlar olmalıdır (Bunları İngilizce olarak ayarla): "job_type", "date", "trailer_type", "temperature_range", "adr_class", "gtip_codes", "cargo_type", "tonnage", "departure_point", "destination_point", "loading_type", "request_status", "route_note".
 
 E-posta içeriği:
 {email_content}
@@ -70,40 +79,40 @@ E-posta içeriği:
     system_prompt = 'Sen, Türkçe, İngilizce ve Rusça gelen nakliye metinlerini anlayan ve istenen bilgileri kesinlikle formatı bozulmamış bir JSON olarak ayıklayan uzman bir AI lojistik asistanısın.'
     
     try:
-        # Seçili Modele İstek Atma
+        # Sending request to the selected model
         if LLM_TYPE.lower() == "online":
             api_key = os.getenv("GOOGLE_API_KEY")
             if not api_key:
-                print("HATA: .env dosyasında GOOGLE_API_KEY bulunamadı.")
+                print("ERROR: GOOGLE_API_KEY could not be found in the .env file.")
                 return None
             
-            print(f"[*] Google modeli ({GOOGLE_MODEL}) ile analiz ediliyor [ONLINE]...")
+            print(f"[*] Analyzing with Google model ({GOOGLE_MODEL}) [ONLINE]...")
             result_text = parse_with_google(prompt, system_prompt, GOOGLE_MODEL, api_key)
             
         elif LLM_TYPE.lower() == "offline":
-            print(f"[*] Ollama modeli ({OLLAMA_MODEL}) ile analiz ediliyor [OFFLINE]...")
+            print(f"[*] Analyzing with Ollama model ({OLLAMA_MODEL}) [OFFLINE]...")
             result_text = parse_with_ollama(prompt, system_prompt, OLLAMA_MODEL)
             
         else:
-            print(f"HATA: Geçersiz LLM_TYPE '{LLM_TYPE}'. 'offline' veya 'online' olmalı.")
+            print(f"ERROR: Invalid LLM_TYPE '{LLM_TYPE}'. It must be 'offline' or 'online'.")
             return None
 
-        # Markdown formatında kod bloğu geldiyse temizle
+        # Clean if a markdown code block is returned
         result_text = result_text.strip()
         if result_text.startswith("```json"): result_text = result_text[7:]
         if result_text.startswith("```"): result_text = result_text[3:]
         if result_text.endswith("```"): result_text = result_text[:-3]
         result_text = result_text.strip()
         
-        # JSON'a ayrıştır
+        # Parse into JSON
         parsed_data = json.loads(result_text)
         return parsed_data
         
     except json.JSONDecodeError:
-        print("HATA: Modelden dönen metin geçerli bir JSON değil.\nDönen Metin:", result_text)
+        print("ERROR: The text returned from the model is not a valid JSON.\nReturned Text:", result_text)
         return None
     except Exception as e:
-        print("Beklenmeyen bir hata oluştu:", str(e))
+        print("An unexpected error occurred:", str(e))
         return None
 
 if __name__ == "__main__":
@@ -124,9 +133,9 @@ if __name__ == "__main__":
 
     """
     
-    print("\n=== Nakliye Talebi Ayrıştırma ===")
+    print("\n=== Freight Request Parsing ===")
     extracted_info = parse_freight_email(sample_email)
     
     if extracted_info:
-        print("\nÇIKARILAN JSON BİLGİSİ:")
+        print("\nEXTRACTED JSON INFORMATION:")
         print(json.dumps(extracted_info, indent=4, ensure_ascii=False))
