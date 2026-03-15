@@ -70,7 +70,7 @@ def parse_freight_email(email_content: str) -> dict:
 ÖNEMLİ KURALLAR:
 1. SADECE geçerli bir JSON objesi döndür. Ekstra metin, ```json veya açıklama OLMASIN.
 2. Bir bilgi çıkarılamıyorsa değerine null veya "belirtilmemiş" yaz.
-3. JSON anahtarları tam olarak şunlar olmalıdır (Bunları İngilizce olarak ayarla): "job_type", "date", "trailer_type", "temperature_range", "adr_class", "gtip_codes", "cargo_type", "tonnage", "departure_point", "destination_point", "loading_type", "request_status", "route_note".
+3. JSON anahtarları tam olarak şunlar olmalıdır: "is_turu", "tarih", "romork_cinsi", "sicaklik_araligi", "adr_sinifi", "gtip_kodlari", "yuk_turu", "tonaj", "kalkis_noktasi", "varis_noktasi", "yukleme_tipi", "talep_durumu", "rota_notu".
 
 E-posta içeriği:
 {email_content}
