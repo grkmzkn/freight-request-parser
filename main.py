@@ -12,7 +12,7 @@ except ImportError:
 load_dotenv()
 
 # Select the operating mode here: 'offline' or 'online'
-LLM_TYPE = "online" # "offline" runs the local Ollama model, "online" runs the Gemini model.
+LLM_TYPE = "offline" # "offline" runs the local Ollama model, "online" runs the Gemini model.
 
 OLLAMA_MODEL = "qwen2.5:3b"
 GOOGLE_MODEL = "gemini-2.5-flash"
