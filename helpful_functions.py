@@ -73,10 +73,51 @@ def parse_freight_email(email_content: str) -> dict:
 2. Bir bilgi çıkarılamıyorsa değerine null veya "belirtilmemiş" yaz.
 3. JSON anahtarları tam olarak şunlar olmalıdır: "is_turu", "tarih", "romork_cinsi", "sicaklik_araligi", "adr_sinifi", "gtip_kodlari", "yuk_turu", "tonaj", "kalkis_noktasi", "varis_noktasi", "yukleme_tipi", "talep_durumu", "rota_notu".
 
-E-posta içeriği:
+Örnek E-posta (One-Shot Example):
+"
+Konu: SB972/FCA Brugerio (Italy) - Uralsk / FTL +5+10
+    Merhaba Yağmur hanım
+
+    FCA Brugerio - Uralsk
+    Frigo +5+10
+    ADR-3 sınıf
+    GTİP - 32091000, 32089091, 32081090
+    21 ton
+    Rusya ile geçebilir
+    Yük hazır
+
+    Saygılarımla / Best regards / С уважением
+"
+
+Örnek Çıktı:
+{{
+  "is_turu": "FCA",
+  "tarih": null,
+  "romork_cinsi": "Frigo",
+  "sicaklik_araligi": "+5 +10",
+  "adr_sinifi": "3",
+  "gtip_kodlari": [32091000, 32089091, 32081090],
+  "yuk_turu": null,
+  "tonaj": "21 ton",
+  "kalkis_noktasi": "Brugerio",
+  "varis_noktasi": "Uralsk",
+  "yukleme_tipi": "FTL",
+  "talep_durumu": "yük hazır",
+  "rota_notu": "Rusya ile geçebilir"
+}}
+
+Şimdi aşağıdaki e-posta içeriği için aynı işlemi gerçekleştir:
 {email_content}
 """
-    system_prompt = 'Sen, Türkçe, İngilizce ve Rusça gelen nakliye metinlerini anlayan ve istenen bilgileri kesinlikle formatı bozulmamış bir JSON olarak ayıklayan uzman bir AI lojistik asistanısın.'
+    system_prompt = (
+        "Sen lojistik ve tedarik zinciri alanında uzmanlaşmış, çok dilli (Türkçe, İngilizce, Rusça) "
+        "kıdemli bir veri çıkarma asistanısın. Tek ve yegane görevin, sana verilen nakliye e-postalarından "
+        "istenen bilgileri ayıklayıp SADECE ve kesinlikle geçerli bir JSON objesi üretmektir.\n\n"
+        "KESİN KURALLAR:\n"
+        "1. Asla JSON formatı dışında bir kelime, selamlama veya açıklama (örn: 'İşte JSON formatında sonuç...') yazma.\n"
+        "2. Metinde açıkça belirtilmeyen hiçbir veriyi uydurma (hallucination yapma). Bilgi yoksa veya emin değilsen her zaman null veya 'belirtilmemiş' bırak.\n"
+        "3. Yanıtın doğrudan süslü parantez '{' ile başlayıp '}' ile bitmelidir."
+    )
     
     try:
         if LLM_TYPE.lower() == "online":
