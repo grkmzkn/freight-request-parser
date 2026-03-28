@@ -2,6 +2,9 @@ import json
 import ollama
 import os
 import pyodbc
+import pandas as pd
+import re
+from datetime import datetime
 from dotenv import load_dotenv
 
 try:
@@ -14,7 +17,7 @@ load_dotenv()
 
 # --- SETTINGS ---
 LLM_TYPE = "offline"  # "offline" or "online"
-OLLAMA_MODEL = "qwen2.5:3b"
+OLLAMA_MODEL = "qwen2.5:7b" #3b 7b
 GOOGLE_MODEL = "gemini-2.5-flash"
 
 SERVER_NAME = os.getenv("DB_SERVER_NAME")
@@ -22,23 +25,144 @@ DB_NAME = os.getenv("DB_NAME")
 
 
 # ==========================================
+# TEXT PROCESSING & IO FUNCTIONS
+# ==========================================
+
+def clean_email_body(body):
+    """Maillerin içeriğini temizleyip, imza ve uyarıları ayırır."""
+    if not body:
+        return ""
+        
+    # 1. Bilinen veda kalıplarından böl (case-insensitive)
+    sign_offs = [
+        r"best regards", r"kind regards", r"regards", r"sincerely", 
+        r"saygilarimla", r"saygılarımla", r"iyi calismalar", r"iyi çalışmalar",
+        r"с уважением", r"с наилучшими пожеланиями", r"mit freundlichen grüßen",
+        r"mit freundlichen gruessen"
+    ]
+    pattern = re.compile(r'\b(?:' + '|'.join(sign_offs) + r')\b', re.IGNORECASE)
+    body = pattern.split(body)[0]
+    
+    # 2. Ayrılmış çizgi bloklarını (--) sil
+    body = re.split(r'\r?\n[ \t]*(?:--+|___+)[ \t]*\r?\n', body)[0]
+    
+    # 3. Yasal uyarılar ve KVKK metinlerinden böl
+    disclaimers = [
+        r"pursuant to reg", r"confidential information", 
+        r"if you are not the addressee", r"bu e-posta", 
+        r"this email and any attachments", r"the information contained in",
+        r"gizlilik uyarisi", r"legal disclaimer"
+    ]
+    disc_pattern = re.compile(r'(?:' + '|'.join(disclaimers) + r')', re.IGNORECASE)
+    body = disc_pattern.split(body)[0]
+    
+    # 4. Paragraf bazlı otomatik imza tespiti 
+    # (Özellikle kalıp kullanmadan doğrudan imza atanlar için)
+    # Metni 2 veya daha fazla "satır atlama" ile paragraflara ayır
+    blocks = re.split(r'(?:\r?\n[ \t]*){2,}', body)
+    valid_body = blocks[0]
+    
+    for block in blocks[1:]:
+        # Bir bloğun "imza" kabul edilmesi için güçlü belirtiler:
+        is_signature = False
+        
+        # 'mailto:' linki içermesi (Outlook doğrudan ekler)
+        if re.search(r'mailto:', block, re.IGNORECASE):
+            is_signature = True
+        # Web sitesi / URL bulunması (http, https veya www)
+        elif re.search(r'\b(?:https?://|www\.)[a-z0-9-]+(?:\.[a-z0-9-]+)+\b', block, re.IGNORECASE):
+            is_signature = True
+        # Hem telefon hem e-mail'in aynı paragrafta yer alması
+        elif re.search(r'\+\d{2,3}[\s.-]?\d{3,}', block) and re.search(r'@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', block):
+            is_signature = True
+            
+        if is_signature:
+            break # Bu ve sonrasını imza kabul edip almayı bırakıyoruz
+        else:
+            valid_body += "\n\n" + block
+            
+    # 5. Kalan temiz metnin içindeki yeni satırları ve çift boşlukları toparla
+    cleaned_content = valid_body.replace('\r\n', '\n')
+    cleaned_content = ' '.join(cleaned_content.split(' ')).strip()
+    
+    return cleaned_content
+
+def log_to_excel(email_content, parsed_data):
+    """Logs the email content and parsed data to a daily Excel file."""
+    today_str = datetime.now().strftime('%d-%m-%Y')
+    log_file = f'log_{today_str}.xlsx'
+    
+    # Prepare the data for the new log entry
+    log_entry_data = {
+        'İşlenme Zamanı': datetime.now().strftime('%d-%m-%Y %H:%M:%S')
+    }
+
+    # If parsing was successful, add the parsed data as separate columns
+    if parsed_data:
+        # Convert list values to a string representation
+        for key, value in parsed_data.items():
+            if isinstance(value, list):
+                parsed_data[key] = ', '.join(map(str, value))
+        log_entry_data.update(parsed_data)
+        
+    # 'mail_icerik' sütunu en sonda olması için veriyi en sona ekliyoruz
+    log_entry_data['mail_icerik'] = email_content
+    
+    # Create a new DataFrame for the current log entry
+    new_log_entry = pd.DataFrame([log_entry_data])
+    
+    # Check if the log file already exists
+    if os.path.exists(log_file):
+        try:
+            # Read the existing file
+            df = pd.read_excel(log_file)
+            # Append the new log entry
+            df = pd.concat([df, new_log_entry], ignore_index=True)
+        except Exception as e:
+            print(f"Error reading Excel file: {e}")
+            # If reading fails, create a new file with the current entry
+            df = new_log_entry
+    else:
+        # If the file doesn't exist, the new entry is the DataFrame
+        df = new_log_entry
+        
+    # Save the DataFrame to the Excel file
+    try:
+        df.to_excel(log_file, index=False)
+    except Exception as e:
+        print(f"Error writing to Excel file: {e}")
+
+
+# ==========================================
 # LLM & PARSING FUNCTIONS
 # ==========================================
 
-def parse_with_ollama(prompt: str, system_prompt: str, model_name: str) -> str:
-    """Performs inference with Ollama and returns the text."""
+def parse_with_ollama(prompt: str, system_prompt: str, model_name: str):
+    """Performs inference with Ollama and returns the text, also printing token usage."""
     response = ollama.chat(
         model=model_name,
         messages=[
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': prompt}
         ],
-        options={"temperature": 0.0}
+        options={
+            "temperature": 0.0,
+            "num_predict": 512,  # Cevaplar 120-160 token arası geldiği için limit 512'den 256'ya düşürüldü
+            "num_ctx": 2048      # Gelen promptlar sabit olarak 1024 civarında geldiği için, biraz pay bırakılarak 1536 idealdir
+        }
     )
+    
+    # Extract token metrics for Ollama
+    prompt_tokens = response.get('prompt_eval_count', 0)
+    eval_tokens = response.get('eval_count', 0)
+    total_tokens = prompt_tokens + eval_tokens
+    
+    print(f"\n[TOKEN USAGE - Ollama] Prompt: {prompt_tokens} | Response: {eval_tokens} | Total: {total_tokens}\n")
+    
     return response['message']['content']
 
-def parse_with_google(prompt: str, system_prompt: str, model_name: str, api_key: str) -> str:
-    """Performs inference with Google Gemini and returns the text."""
+def parse_with_google(prompt: str, system_prompt: str, model_name: str, api_key: str):
+    """Performs inference with Google Gemini and returns both the text and token metadata."""
     if 'genai' not in globals():
         raise ImportError("google-generativeai library is not installed.")
     
@@ -49,74 +173,84 @@ def parse_with_google(prompt: str, system_prompt: str, model_name: str, api_key:
         generation_config={"temperature": 0.0}
     )
     response = model.generate_content(prompt)
+    
+    # Try to extract token metrics if available
+    usage_metadata = getattr(response, 'usage_metadata', None)
+    if usage_metadata:
+        try:
+            print(f"\n[TOKEN USAGE - Google] Prompt: {usage_metadata.prompt_token_count} | Response: {usage_metadata.candidates_token_count} | Total: {usage_metadata.total_token_count}\n")
+        except AttributeError:
+            pass
+            
     return response.text
 
 def parse_freight_email(email_content: str) -> dict:
     """Reads the given email text and returns structured data in JSON format."""
-    prompt = f"""Aşağıdaki e-posta içeriğinden lojistik ve nakliye bilgilerini analiz ederek JSON formatında çıkar:
-- iş türü (örnek: FCA, EXW, DAP)
-- tarih (örnek: 15.03.2024, yarın, vs. Cümle içinde geçiyorsa yakala)
-- römork cinsi (örnek: Frigo, Tenteli, Mega)
-- sıcaklık aralığı (örnek: +5 +10, yoksa null)
-- adr sınıfı (örnek: 3, 9, yoksa null)
-- g tip kodları (örnek: [32091000, 32089091], mutlaka liste (array) formunda olmalı)
-- yük türü (örnek: Kimyasal Ürün, Gıda, Tekstil vs.)
-- tonaj (örnek: 21 ton, 22.000 kg)
-- kalkış noktası (örnek: Brugerio, İtalya veya Brugerio)
-- varış noktası (örnek: Uralsk, Kazakistan veya Uralsk)
-- yükleme tipi (örnek: FTL, LTL, Parsiyel)
-- talep durumu (örnek: Yük hazır, Cuma hazır olacak)
-- rota notu (örnek: Rusya üzerinden geçebilir)
+    prompt = f"""Aşağıdaki e-posta içeriğinden lojistik/nakliye bilgilerini çıkar ve SADECE JSON döndür.
+
+Alan tanımları (uzman kurallar):
+- romork_cinsi: Araç/ekipman tipi (Frigo, Tente, Mega, Kapalı Kasa, 45lik konteyner, swap body, konteyner şase vb.).
+- yukleme_sehri: Yüklemenin yapılacağı şehir.
+- yukleme_ulkesi: Yüklemenin yapılacağı ülke. (İPUCU: Metinde sadece şehir yazıyorsa bile, coğrafi bilgini kullanarak o şehrin hangi ülkede olduğunu bul ve buraya yaz. Örneğin 'Milano' görürsen ülkeye 'İtalya' yaz.)
+- bosaltma_sehri: Teslimatın/boşaltmanın yapılacağı şehir.
+- bosaltma_ulkesi: Teslimatın/boşaltmanın yapılacağı ülke. (İPUCU: Metinde sadece şehir yazıyorsa bile, coğrafi bilgini kullanarak o şehrin hangi ülkede olduğunu bul ve buraya yaz. Örneğin 'Münih' görürsen ülkeye 'Almanya' yaz.)
+- yukleme_tipi: Metinde geçen değere göre FTL, LTL, LCL veya parsiyel vb. olduğu gibi yaz.
+- tarih: Yükleme tarihi/haftası
+- sicaklik_araligi: Taşıma sıcaklığı (+5 +10 gibi)
+- adr_sinifi: ADR sınıfı
+- gtip_kodlari: GTIP kodları listesi
+- tonaj: Ağırlık
+- notlar: Yükleme ile ilgili metinde geçen diğer önemli ek bilgiler, özel talepler, "Rusya'dan geçebilir", "Express teslimat", "Araçta tahta olmalı" gibi güzergah veya araca özel notlar.
 
 ÖNEMLİ KURALLAR:
 1. SADECE geçerli bir JSON objesi döndür. Ekstra metin, ```json veya açıklama OLMASIN.
 2. Bir bilgi çıkarılamıyorsa değerine null veya "belirtilmemiş" yaz.
-3. JSON anahtarları tam olarak şunlar olmalıdır: "is_turu", "tarih", "romork_cinsi", "sicaklik_araligi", "adr_sinifi", "gtip_kodlari", "yuk_turu", "tonaj", "kalkis_noktasi", "varis_noktasi", "yukleme_tipi", "talep_durumu", "rota_notu".
+3. JSON anahtarları tam olarak şunlar olmalıdır: "romork_cinsi", "yukleme_tipi", "yukleme_sehri", "yukleme_ulkesi", "bosaltma_sehri", "bosaltma_ulkesi", "tarih", "sicaklik_araligi", "adr_sinifi", "gtip_kodlari", "tonaj", "notlar".
 
 Örnek E-posta (One-Shot Example):
 "
-Konu: SB972/FCA Brugerio (Italy) - Uralsk / FTL +5+10
-    Merhaba Yağmur hanım
+Konu: SB972/ FCA Brugerio (Italy)  - Uralsk / FTL +5+10
 
-    FCA Brugerio - Uralsk
-    Frigo +5+10
-    ADR-3 sınıf
-    GTİP - 32091000, 32089091, 32081090
-    21 ton
-    Rusya ile geçebilir
-    Yük hazır
+Merhaba Yağmur hanım 
 
-    Saygılarımla / Best regards / С уважением
+FCA Brugerio – Uralsk 
+Frigo +5+10
+ADR – 3 sınıf
+GTİP - 32091000, 32089091, 32081090 
+21 ton
+Rusya ile geçebilir 
+Yük hazır
+
+С уважением / Best regards,
 "
 
 Örnek Çıktı:
 {{
-  "is_turu": "FCA",
-  "tarih": null,
   "romork_cinsi": "Frigo",
+  "yukleme_tipi": "FTL",
+  "yukleme_sehri": "Brugerio",
+  "yukleme_ulkesi": "İtalya",
+  "bosaltma_sehri": "Uralsk",
+  "bosaltma_ulkesi": "Kazakistan",
+  "tarih": null,
   "sicaklik_araligi": "+5 +10",
   "adr_sinifi": "3",
   "gtip_kodlari": [32091000, 32089091, 32081090],
-  "yuk_turu": null,
   "tonaj": "21 ton",
-  "kalkis_noktasi": "Brugerio",
-  "varis_noktasi": "Uralsk",
-  "yukleme_tipi": "FTL",
-  "talep_durumu": "yük hazır",
-  "rota_notu": "Rusya ile geçebilir"
+  "notlar": "Rusya ile geçebilir, Yük hazır"
 }}
 
 Şimdi aşağıdaki e-posta içeriği için aynı işlemi gerçekleştir:
 {email_content}
 """
     system_prompt = (
-        "Sen lojistik ve tedarik zinciri alanında uzmanlaşmış, çok dilli (Türkçe, İngilizce, Rusça) "
-        "kıdemli bir veri çıkarma asistanısın. Tek ve yegane görevin, sana verilen nakliye e-postalarından "
-        "istenen bilgileri ayıklayıp SADECE ve kesinlikle geçerli bir JSON objesi üretmektir.\n\n"
-        "KESİN KURALLAR:\n"
-        "1. Asla JSON formatı dışında bir kelime, selamlama veya açıklama (örn: 'İşte JSON formatında sonuç...') yazma.\n"
-        "2. Metinde açıkça belirtilmeyen hiçbir veriyi uydurma (hallucination yapma). Bilgi yoksa veya emin değilsen her zaman null veya 'belirtilmemiş' bırak.\n"
-        "3. Yanıtın doğrudan süslü parantez '{' ile başlayıp '}' ile bitmelidir."
+        "Sen lojistik ve tedarik zinciri alaninda uzmanlasmis, cok dilli (Turkce, Ingilizce, Rusca) "
+        "kidemli bir veri cikarma asistanisin. Gorevin, nakliye e-postalarindan istenen alanlari "
+        "ayiklayip SADECE gecerli bir JSON objesi uretmektir.\n\n"
+        "KESIN KURALLAR:\n"
+        "1. JSON disinda tek kelime yazma (selamlama, aciklama, kod blogu yok).\n"
+        "2. Metinde yoksa uydurma; emin degilsen null değerini kullan.\n"
+        "3. JSON anahtarlarini ASLA degistirme; sadece istenen anahtarlarla cevap ver."
     )
     
     try:
@@ -140,7 +274,51 @@ Konu: SB972/FCA Brugerio (Italy) - Uralsk / FTL +5+10
         if result_text.endswith("```"): result_text = result_text[:-3]
         result_text = result_text.strip()
         
-        return json.loads(result_text)
+        parsed_data = json.loads(result_text)
+        
+        # --- KONTROL / POST-PROCESSING ADIMI ---
+        
+        # 1. Römork Cinsi Kontrolü
+        # Eğer römork cinsi gelmemişse (null, empty, belirtilmemiş vb.) her zaman 'tente' yap.
+        romork_val = parsed_data.get("romork_cinsi")
+        if not romork_val or str(romork_val).strip().lower() in ["null", "none", "belirtilmemiş", ""]:
+            parsed_data["romork_cinsi"] = "tenteli"
+            
+        # 1.1 Intermodal Kontrolü
+        romork_cinsi_lower = str(parsed_data.get("romork_cinsi", "")).strip().lower()
+        if romork_cinsi_lower in ["45lik konteyner", "swap body", "konteyner şase"]:
+            parsed_data["intermodal"] = "Evet"
+        else:
+            parsed_data["intermodal"] = "Hayır"
+            
+        # 2. Yükleme Tipi Kontrolü (FTL vs LTL)
+        yukleme_val = str(parsed_data.get("yukleme_tipi") or "").strip().lower()
+        if "ftl" in yukleme_val:
+            parsed_data["yukleme_tipi"] = "komple"
+        elif any(kw in yukleme_val for kw in ["ltl", "lcl", "parsiyel"]):
+            parsed_data["yukleme_tipi"] = "LTL"
+            
+        # 3. İş Türü Kontrolü ve Hesaplanması
+        yukleme_ulkesi = str(parsed_data.get("yukleme_ulkesi") or "").strip().lower()
+        bosaltma_ulkesi = str(parsed_data.get("bosaltma_ulkesi") or "").strip().lower()
+        
+        turkiye_aliases = ["türkiye", "turkiye", "turkey", "tr"]
+        
+        is_yuk_tr = any(alias in yukleme_ulkesi for alias in turkiye_aliases)
+        is_bos_tr = any(alias in bosaltma_ulkesi for alias in turkiye_aliases)
+        
+        if not yukleme_ulkesi or yukleme_ulkesi == "null" or not bosaltma_ulkesi or bosaltma_ulkesi == "null":
+            parsed_data["is_turu"] = "Belirsiz"
+        elif is_yuk_tr and is_bos_tr:
+            parsed_data["is_turu"] = "Yurtiçi"
+        elif is_yuk_tr and not is_bos_tr:
+            parsed_data["is_turu"] = "İhracat"
+        elif not is_yuk_tr and is_bos_tr:
+            parsed_data["is_turu"] = "İthalat"
+        else:
+            parsed_data["is_turu"] = "Transit"
+            
+        return parsed_data
         
     except json.JSONDecodeError:
         print("ERROR: Text returned from model is not a valid JSON.\nText:", result_text)
@@ -263,4 +441,3 @@ def insert_freight_request(parsed_data: dict):
     conn.close()
     
     print(f"[*] Request successfully added to MSSQL database! (Request ID: {inserted_id}, Trailer ID: {trailer_id})")
-
