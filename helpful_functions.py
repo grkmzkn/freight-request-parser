@@ -8,16 +8,21 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 try:
+    from geopy.geocoders import Nominatim
+except ImportError:
+    pass
+
+try:
     import google.generativeai as genai
 except ImportError:
     pass
 
-# Load environment variables
+# Ortam değişkenlerini yükle
 load_dotenv()
 
-# --- SETTINGS ---
+# --- AYARLAR ---
 LLM_TYPE = "offline"  # "offline" or "online"
-OLLAMA_MODEL = "qwen2.5:7b" #3b 7b
+OLLAMA_MODEL = "qwen2.5:7b" #qwen2.5:3b qwen2.5:7b qwen3:8b qwen2.5:14b
 GOOGLE_MODEL = "gemini-2.5-flash"
 
 SERVER_NAME = os.getenv("DB_SERVER_NAME")
@@ -25,7 +30,7 @@ DB_NAME = os.getenv("DB_NAME")
 
 
 # ==========================================
-# TEXT PROCESSING & IO FUNCTIONS
+# METİN İŞLEME VE G/Ç (Girdi/Çıktı) FONKSİYONLARI
 # ==========================================
 
 def clean_email_body(body):
@@ -72,8 +77,12 @@ def clean_email_body(body):
         # Web sitesi / URL bulunması (http, https veya www)
         elif re.search(r'\b(?:https?://|www\.)[a-z0-9-]+(?:\.[a-z0-9-]+)+\b', block, re.IGNORECASE):
             is_signature = True
-        # Hem telefon hem e-mail'in aynı paragrafta yer alması
-        elif re.search(r'\+\d{2,3}[\s.-]?\d{3,}', block) and re.search(r'@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', block):
+        # Sadece Telefon numarası (Uluslararası format veya sık kullanılan tanımlar: Tel, Mob vs.) 
+        # tespit edilirse, bu bloğu ve sonrasını imza kabul et 
+        elif re.search(r'(?:\b(?:tel|mob|gsm|phone|telefon|cell|t|m)\b[\s.:]*\+?\d{2,})|(?:\+\d{2,3}[\s.-]?\d{3,}[\s.-]?\d{2,})', block, re.IGNORECASE):
+            is_signature = True
+        # Zaten e-mail adresi (isim@domain.com) geçiyorsa doğrudan imza kabul et
+        elif re.search(r'@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', block):
             is_signature = True
             
         if is_signature:
@@ -87,19 +96,162 @@ def clean_email_body(body):
     
     return cleaned_content
 
+def verify_city(city_name, country_name=None):
+    """Verilen lokasyonun (semt/ilçe) bağlı olduğu asıl Şehri ve Ülkeyi bulur."""
+    # Bazı ülkelerin isimlerini standartlaştırma
+    if country_name and country_name.strip().lower() in ["ozman", "ozakman"]:
+        country_name = "Uzbekistan"
+
+    is_city_empty = not city_name or str(city_name).lower() in ["null", "none", "", "belirtilmemiş"]
+    is_country_empty = not country_name or str(country_name).lower() in ["null", "none", "", "belirtilmemiş"]
+    
+    if is_city_empty and is_country_empty:
+        return city_name, country_name
+        
+    search_query = ""
+    if not is_city_empty:
+        search_query += str(city_name)
+    if not is_country_empty:
+        if search_query:
+            search_query += f", {country_name}"
+        else:
+            search_query = str(country_name)
+        
+    try:
+        # Eğer geopy yüklü değilse orjinal ismi ve boş ülke dön (kod kırılasın)
+        if 'Nominatim' not in globals():
+            return city_name, country_name
+            
+        geolocator = Nominatim(user_agent="mutlular_lojistik_bot")
+        
+        import time
+        # 1. Önce Türkçe dilde çek
+        location_tr = geolocator.geocode(search_query, addressdetails=True, namedetails=True, timeout=3, language="tr")
+        time.sleep(1.5) # Nominatim 1 saniye kuralı için 1.5 sn uyuma (5 saniye programı çok yavaşlatır)
+        # 2. Sonra İngilizce dilde çek
+        location_en = geolocator.geocode(search_query, addressdetails=True, namedetails=True, timeout=3, language="en")
+        
+        location = location_tr or location_en
+        
+        if location and 'address' in location.raw:
+            address = location_tr.raw['address'] if location_tr else location_en.raw['address']
+            names = location.raw.get('namedetails', {})
+            
+            country_tr = location_tr.raw['address'].get('country') if location_tr and 'address' in location_tr.raw else ""
+            country_en = location_en.raw['address'].get('country') if location_en and 'address' in location_en.raw else ""
+            
+            llm_country = str(country_name).strip().lower() if country_name else ""
+            
+            # LLM'in İngilizce (Belarus) veya Türkçe (Beyaz Rusya) eşleşmelerinden 
+            # haritanın çevirilerinden birine uyuyorsa LLM'in orijinal halini (Örn: Belarus) koru
+            if llm_country and (llm_country == str(country_en).strip().lower() or llm_country == str(country_tr).strip().lower()):
+                real_country = country_name.strip()
+            else:
+                real_country = country_tr or country_en # Uymuyorsa haritanın Türkçe/İngilizce birleşimini al
+                
+            # Bazı ülkelerin isimlerini standartlaştırma (Örn: Rusya Federasyonu -> Rusya)
+            if real_country and real_country.strip().lower() in ["rusya federasyonu", "russian federation"]:
+                real_country = "Rusya"
+
+            # Bazı ülkelerin isimlerini standartlaştırma (Örn: Rusya Federasyonu -> Rusya)
+            if real_country and real_country.strip().lower() in ["beyaz rusya"]:
+                real_country = "Belarus"
+                
+            # Sadece ülke girdiysek, şehri boş döndür ama ülkeyi doğrulanmış dön
+            if is_city_empty:
+                return None, real_country
+                
+            # Türkiye'de ilçeler 'town', şehirler (iller) 'province' olarak döner. 
+            # Lojistikte il bazında gruplama yapmak için TR'deysek önceliği province'e (İl'e) veriyoruz.
+            if address.get('country_code', '').lower() == 'tr':
+                default_city = address.get('province') or address.get('city') or address.get('town') or address.get('state') or city_name
+            else:
+                default_city = address.get('city') or address.get('town') or address.get('province') or address.get('state') or city_name
+            
+            # "Eyaleti", "Region", "İli" gibi harita servisinden gelen idari ekleri temizleyen yardımcı fonksiyon
+            def clean_suffix(name):
+                if not name or not isinstance(name, str): return name
+                suffixes = [r'\s+eyaleti$', r'\s+region$', r'\s+province$', r'\s+ili$', r'\s+oblast$', r'\s+oblastı$', r'\s+vilayeti$', r'\s+city$', r'\s+district$']
+                for suffix in suffixes:
+                    name = re.sub(suffix, '', name, flags=re.IGNORECASE)
+                return name.strip()
+                
+            cleaned_input = clean_suffix(city_name).lower()
+            
+            # Öncelikli kontrol edilecek diller (Türkçe ve İngilizce) ile harita varsayılanı
+            tr_name = clean_suffix(names.get('name:tr'))
+            en_name = clean_suffix(names.get('name:en'))
+            def_name = clean_suffix(default_city)
+            
+            # --- ÜST HİYERARŞİ (İL/ŞEHİR) KONTROLÜ ---
+            # Bulunan objenin kendi tercümeleri (names.values())
+            valid_names_lower = [clean_suffix(str(v)).lower() for v in names.values() if v]
+            is_parent_entity = True
+            
+            if def_name:
+                for vn in valid_names_lower:
+                    if def_name.lower() == vn or def_name.lower() in vn or vn in def_name.lower():
+                        is_parent_entity = False
+                        break
+            else:
+                is_parent_entity = False
+                
+            # Eğer haritanın döndürdüğü üst şehir/il (def_name), bulunan hedefin (Erenköy)
+            # çevirilerinden hiçbirine uymuyorsa, obje bir alt birimdir (ilçe/semt) demektir.
+            # Lojistikte ana şehri/ili kullanmak için bu üst birimi döndürüyoruz.
+            if is_parent_entity and def_name:
+                return def_name, real_country
+            
+            prioritized_locations = []
+            if tr_name: prioritized_locations.append(tr_name)
+            if en_name: prioritized_locations.append(en_name)
+            if def_name: prioritized_locations.append(def_name)
+            
+            final_city = clean_suffix(city_name)
+            match_found = False
+            
+            # Öncelikle TR veya EN adı, LLM'in çıkardığı ifadenin içinde geçiyor mu diye bak
+            # Örn: loc="Rotterdam", cleaned_input="rotterdam-waalhaven" -> Eşleşir ve "Rotterdam" döner
+            for loc in prioritized_locations:
+                if loc.lower() in cleaned_input:
+                    final_city = loc
+                    match_found = True
+                    break
+                    
+            if not match_found:
+                # Eşleşme yoksa eski uluslararası liste (esnek) eşleşmesini ara (Yazım hatası varsa orijinali koru)
+                valid_names = [clean_suffix(str(v)).lower() for v in names.values() if v]
+                valid_names.append(def_name.lower())
+                
+                is_flexible_match = False
+                for vn in valid_names:
+                    if cleaned_input == vn or cleaned_input in vn or vn in cleaned_input:
+                        is_flexible_match = True
+                        break
+                        
+                if not is_flexible_match:
+                    final_city = def_name # Hiçbir şekilde eşleşmiyorsa haritanın varsayılan ismini kullan
+            
+            return final_city, real_country
+            
+    except Exception as e:
+        print(f"[Uyarı] Şehir/Lokasyon doğrulanırken hata ({city_name}, {country_name}): {e}")
+        
+    return city_name, country_name # Bulamazsa veya hata alırsa LLM'in verdiği orijinal değeri döner
+
 def log_to_excel(email_content, parsed_data):
-    """Logs the email content and parsed data to a daily Excel file."""
+    """Mail içeriğini ve ayrıştırılmış verileri günlük bir Excel dosyasına kaydeder."""
     today_str = datetime.now().strftime('%d-%m-%Y')
     log_file = f'log_{today_str}.xlsx'
     
-    # Prepare the data for the new log entry
+    # Yeni log kaydı için veriyi hazırla
     log_entry_data = {
         'İşlenme Zamanı': datetime.now().strftime('%d-%m-%Y %H:%M:%S')
     }
 
-    # If parsing was successful, add the parsed data as separate columns
+    # Ayrıştırma başarılıysa, ayrıştırılan verileri ayrı sütunlar olarak ekle
     if parsed_data:
-        # Convert list values to a string representation
+        # Liste değerlerini metin (string) formatına dönüştür
         for key, value in parsed_data.items():
             if isinstance(value, list):
                 parsed_data[key] = ', '.join(map(str, value))
@@ -108,63 +260,65 @@ def log_to_excel(email_content, parsed_data):
     # 'mail_icerik' sütunu en sonda olması için veriyi en sona ekliyoruz
     log_entry_data['mail_icerik'] = email_content
     
-    # Create a new DataFrame for the current log entry
+    # Sadece bu log kaydı için yeni bir DataFrame oluştur
     new_log_entry = pd.DataFrame([log_entry_data])
     
-    # Check if the log file already exists
+    # Kayıt (log) dosyasının zaten var olup olmadığını kontrol et
     if os.path.exists(log_file):
         try:
-            # Read the existing file
+            # Var olan dosyayı oku
             df = pd.read_excel(log_file)
-            # Append the new log entry
+            # Yeni log kaydını dosyanın sonuna ekle
             df = pd.concat([df, new_log_entry], ignore_index=True)
         except Exception as e:
-            print(f"Error reading Excel file: {e}")
-            # If reading fails, create a new file with the current entry
+            print(f"Excel dosyası okunurken hata oluştu: {e}")
+            # Okuma başarısız olursa, güncel kayıt ile yeni bir dosya oluştur
             df = new_log_entry
     else:
-        # If the file doesn't exist, the new entry is the DataFrame
+        # Eğer dosya yoksa, yeni kayıt DataFrame'in ta kendisidir
         df = new_log_entry
         
-    # Save the DataFrame to the Excel file
+    # DataFrame'i Excel dosyasına kaydet
     try:
         df.to_excel(log_file, index=False)
     except Exception as e:
-        print(f"Error writing to Excel file: {e}")
+        print(f"Excel dosyasına yazılırken hata oluştu: {e}")
 
 
 # ==========================================
-# LLM & PARSING FUNCTIONS
+# DİL MODELİ & AYRIŞTIRMA FONKSİYONLARI
 # ==========================================
 
 def parse_with_ollama(prompt: str, system_prompt: str, model_name: str):
-    """Performs inference with Ollama and returns the text, also printing token usage."""
+    """Ollama ile çıkarım yapar ve metni döndürür, aynı zamanda token kullanımını ekrana yazdırır."""
     response = ollama.chat(
         model=model_name,
         messages=[
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': prompt}
         ],
+        #keep_alive=0, İşlem biter bitmez modeli RAM/VRAM'den boşaltır (performans sorunu yaşamamak için)
         options={
             "temperature": 0.0,
-            "num_predict": 512,  # Cevaplar 120-160 token arası geldiği için limit 512'den 256'ya düşürüldü
-            "num_ctx": 2048      # Gelen promptlar sabit olarak 1024 civarında geldiği için, biraz pay bırakılarak 1536 idealdir
+            "num_predict": 1024,  # Modelin üretebileceği MAKSİMUM ÇIKTI (token) sınırı. Düşük olursa uretilen JSON yarım kalır.
+            "num_ctx": 2048,      # Modelin hafızası (Girdi + Çıktı toplamı). Düşük olursa model e-postanın başını (prompt kurallarını) unutur.
+            "num_thread": 8
         }
     )
     
-    # Extract token metrics for Ollama
+    # Ollama için token metriklerini çıkar
     prompt_tokens = response.get('prompt_eval_count', 0)
     eval_tokens = response.get('eval_count', 0)
     total_tokens = prompt_tokens + eval_tokens
     
-    print(f"\n[TOKEN USAGE - Ollama] Prompt: {prompt_tokens} | Response: {eval_tokens} | Total: {total_tokens}\n")
+    print(f"\n[TOKEN KULLANIMI - Ollama] Girdi (Prompt): {prompt_tokens} | Çıktı (Response): {eval_tokens} | Toplam: {total_tokens}\n")
     
     return response['message']['content']
 
 def parse_with_google(prompt: str, system_prompt: str, model_name: str, api_key: str):
-    """Performs inference with Google Gemini and returns both the text and token metadata."""
+    """Google Gemini ile çıkarım yapar ve dönen metni ekrana yazdırır."""
     if 'genai' not in globals():
-        raise ImportError("google-generativeai library is not installed.")
+        raise ImportError("google-generativeai kütüphanesi yüklü değil.")
     
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(
@@ -174,58 +328,204 @@ def parse_with_google(prompt: str, system_prompt: str, model_name: str, api_key:
     )
     response = model.generate_content(prompt)
     
-    # Try to extract token metrics if available
+    # Token metriklerini mümkünse almayı dene
     usage_metadata = getattr(response, 'usage_metadata', None)
     if usage_metadata:
         try:
-            print(f"\n[TOKEN USAGE - Google] Prompt: {usage_metadata.prompt_token_count} | Response: {usage_metadata.candidates_token_count} | Total: {usage_metadata.total_token_count}\n")
+            print(f"\n[TOKEN KULLANIMI - Google] Girdi (Prompt): {usage_metadata.prompt_token_count} | Çıktı (Response): {usage_metadata.candidates_token_count} | Toplam: {usage_metadata.total_token_count}\n")
         except AttributeError:
             pass
             
     return response.text
 
-def parse_freight_email(email_content: str) -> dict:
-    """Reads the given email text and returns structured data in JSON format."""
-    prompt = f"""Aşağıdaki e-posta içeriğinden lojistik/nakliye bilgilerini çıkar ve SADECE JSON döndür.
+def extract_multiple_requests(email_content: str) -> list:
+    """Verilen mailde çoklu talep olduğu bilindiğinde, tüm rotaları/talepleri bulup JSON dizisi olarak çıkarır."""
+    prompt = f"""Aşağıdaki gönderilen e-posta içeriğinde BİRDEN FAZLA farklı navlun talebi (farklı yükleme-boşaltma lokasyonları, farklı araç tipleri vb.) geçmektedir.
+GÖREVİN:
+E-postayı analiz et ve içindeki TÜM rotaları/talepleri ayrı ayrı çıkar.
+SADECE bir JSON ARRAY (Liste) formatında çıktı üret. Listenin her bir elemanı bir rota/talep için aşağıdaki alanlara sahip bir JSON NESNESİ olmalıdır:
 
-Alan tanımları (uzman kurallar):
-- romork_cinsi: Araç/ekipman tipi (Frigo, Tente, Mega, Kapalı Kasa, 45lik konteyner, swap body, konteyner şase vb.).
-- yukleme_sehri: Yüklemenin yapılacağı şehir.
-- yukleme_ulkesi: Yüklemenin yapılacağı ülke. (İPUCU: Metinde sadece şehir yazıyorsa bile, coğrafi bilgini kullanarak o şehrin hangi ülkede olduğunu bul ve buraya yaz. Örneğin 'Milano' görürsen ülkeye 'İtalya' yaz.)
-- bosaltma_sehri: Teslimatın/boşaltmanın yapılacağı şehir.
-- bosaltma_ulkesi: Teslimatın/boşaltmanın yapılacağı ülke. (İPUCU: Metinde sadece şehir yazıyorsa bile, coğrafi bilgini kullanarak o şehrin hangi ülkede olduğunu bul ve buraya yaz. Örneğin 'Münih' görürsen ülkeye 'Almanya' yaz.)
-- yukleme_tipi: Metinde geçen değere göre FTL, LTL, LCL veya parsiyel vb. olduğu gibi yaz.
-- tarih: Yükleme tarihi/haftası
-- sicaklik_araligi: Taşıma sıcaklığı (+5 +10 gibi)
-- adr_sinifi: ADR sınıfı
-- gtip_kodlari: GTIP kodları listesi
-- tonaj: Ağırlık
-- notlar: Yükleme ile ilgili metinde geçen diğer önemli ek bilgiler, özel talepler, "Rusya'dan geçebilir", "Express teslimat", "Araçta tahta olmalı" gibi güzergah veya araca özel notlar.
+## ALAN TANIMLARI
 
-ÖNEMLİ KURALLAR:
-1. SADECE geçerli bir JSON objesi döndür. Ekstra metin, ```json veya açıklama OLMASIN.
-2. Bir bilgi çıkarılamıyorsa değerine null veya "belirtilmemiş" yaz.
-3. JSON anahtarları tam olarak şunlar olmalıdır: "romork_cinsi", "yukleme_tipi", "yukleme_sehri", "yukleme_ulkesi", "bosaltma_sehri", "bosaltma_ulkesi", "tarih", "sicaklik_araligi", "adr_sinifi", "gtip_kodlari", "tonaj", "notlar".
+| Alan | Açıklama | Örnek Değerler |
+|------|----------|----------------|
+| romork_cinsi | Araç/ekipman tipi | "Frigo", "Tente", "Mega", "Kapalı Kasa" |
+| yukleme_tipi | Eğer metinde AÇIKÇA (FTL, LTL, LCL, Parsiyel, Komple vb.) belirtilmemişse boş (null) bırak, asla kendin tahmin etme. Eğer geçiyorsa olduğu gibi yaz. | "FTL", "LTL", "LCL", "Parsiyel", null |
+| yukleme_sehri | Yükleme şehrini yaz. Semt gibi bilgileri dahil etme, yalnızca şehir bilgisini çıkar. | "Milano" |
+| yukleme_ulkesi | Yükleme ülkesi — şehirden çıkar gerekirse | "İtalya" |
+| bosaltma_sehri | Boşaltma şehrini yaz. Semt gibi bilgileri dahil etme, yalnızca şehir bilgisini çıkar. | "Uralsk" |
+| bosaltma_ulkesi | Boşaltma ülkesi — şehirden çıkar gerekirse | "Kazakistan" |
+| tarih | Yükleme tarihi veya haftası (metin olarak) | "15.07.2025", "W28" |
+| sicaklik_araligi | Taşıma sıcaklığı (orijinal formatta) | "+2 +8", "-18" |
+| adr_sinifi | ADR tehlike sınıfı (yalnızca rakam/kod) | "3", "6.1" |
+| gtip_kodlari | GTİP/HS kodları listesi (string olarak) | ["32091000", "32089091"] |
+| tonaj | Ağırlık bilgisi (birimle birlikte) | "21 ton", "24.500 kg" |
+| notlar | Özel talepler, geçiş kısıtları, ek bilgiler | "Rusya transit" |
 
-Örnek E-posta (One-Shot Example):
-"
-Konu: SB972/ FCA Brugerio (Italy)  - Uralsk / FTL +5+10
+Taleplere ortak olan bilgileri (tarih, ağırlık, gönderici notu) çıkardığın her bir JSON nesnesinin içine dahil et.
 
-Merhaba Yağmur hanım 
+## ŞEHİR → ÜLKE ÇIKARIM KURALLARI
+- Şehir açıkça yazılmış ama ülke yoksa, bilinen coğrafyadan ülkeyi çıkar.
+- Emin değilsen null bırak, uydurma.
+- Örnekler: Uralsk → Kazakistan, Brugerio → İtalya, Duisburg → Almanya
 
+E-posta:
+{email_content}
+    """
+    system_prompt = "Sen uzman bir lojistik analiz motorusun. Çıktın her zaman YALNIZCA geçerli bir JSON Listesi (Array of objects) olmalıdır."
+    
+    try:
+        if LLM_TYPE.lower() == "online":
+            api_key = os.getenv("GOOGLE_API_KEY")
+            result_text = parse_with_google(prompt, system_prompt, GOOGLE_MODEL, api_key)
+        elif LLM_TYPE.lower() == "offline":
+            result_text = parse_with_ollama(prompt, system_prompt, OLLAMA_MODEL)
+            
+        result_text = result_text.strip()
+        
+        # Markdown etiketlerini temizle ve JSON ayırma
+        if "```json" in result_text:
+            result_text = result_text.split("```json")[-1].split("```")[0].strip()
+        elif result_text.startswith("```"): 
+            result_text = result_text[3:]
+        if result_text.endswith("```"): 
+            result_text = result_text[:-3]
+
+        start_idx = result_text.find('[')
+        end_idx = result_text.rfind(']')
+        if start_idx != -1 and end_idx != -1:
+            result_text = result_text[start_idx:end_idx+1]
+            
+        result_text = result_text.replace('\\_', '_')
+        
+        try:
+            import ast
+            parsed_list = json.loads(result_text)
+        except json.JSONDecodeError:
+            try:
+                parsed_list = ast.literal_eval(result_text)
+            except Exception as e:
+                print(f"HATA: Modelden çoklu talep için dönen metin geçerli bir JSON dizisi değil. Metin:\n{result_text}")
+                parsed_list = []
+                
+        if not isinstance(parsed_list, list) or len(parsed_list) == 0:
+            print("[HATA] Model JSON listesi (array) döndüremedi. Boş liste veya tekil hatalı satır dönüyor.")
+            parsed_list = [{"notlar": "HATA: Otomatik çoklu ayrıştırma başarısız oldu veya liste alınamadı."}]
+            
+        print(f"\n[BİLGİ] E-postadan toplam {len(parsed_list)} farklı talep çıkarıldı.")
+        
+        # Temel Post-Processing her bir öğe için
+        for parsed_data in parsed_list:
+            if not isinstance(parsed_data, dict):
+                continue
+                
+            # Nominatim (OpenStreetMap) Geocoding - Şehir/Semt Düzeltme ve Ülke Tespiti
+            yuk_sehir, yuk_ulke = verify_city(parsed_data.get("yukleme_sehri"), parsed_data.get("yukleme_ulkesi"))
+            if yuk_sehir: parsed_data["yukleme_sehri"] = yuk_sehir
+            if yuk_ulke: parsed_data["yukleme_ulkesi"] = yuk_ulke
+            
+            bos_sehir, bos_ulke = verify_city(parsed_data.get("bosaltma_sehri"), parsed_data.get("bosaltma_ulkesi"))
+            if bos_sehir: parsed_data["bosaltma_sehri"] = bos_sehir
+            if bos_ulke: parsed_data["bosaltma_ulkesi"] = bos_ulke
+                
+            # 1. Römork Cinsi Kontrolü
+            romork_val = parsed_data.get("romork_cinsi")
+            if not romork_val or str(romork_val).strip().lower() in ["null", "none", "belirtilmemiş", ""]:
+                parsed_data["romork_cinsi"] = "Tenteli"
+            elif str(romork_val).strip().lower() in ["tente", "tenteli"]:
+                parsed_data["romork_cinsi"] = "Tenteli"
+                
+            romork_cinsi_lower = str(parsed_data.get("romork_cinsi", "")).strip().lower()
+            if romork_cinsi_lower in ["45lik konteyner", "swap body", "konteyner şase"]:
+                parsed_data["intermodal"] = "Evet"
+            else:
+                parsed_data["intermodal"] = "Hayır"
+                
+            yukleme_val = str(parsed_data.get("yukleme_tipi") or "").strip().lower()
+            if "ftl" in yukleme_val:
+                parsed_data["yukleme_tipi"] = "komple"
+            elif any(kw in yukleme_val for kw in ["ltl", "lcl", "parsiyel"]):
+                parsed_data["yukleme_tipi"] = "LTL"
+                
+            yuk_ulk = str(parsed_data.get("yukleme_ulkesi") or "").strip().lower()
+            bos_ulk = str(parsed_data.get("bosaltma_ulkesi") or "").strip().lower()
+            turkiye_aliases = ["türkiye", "turkiye", "turkey", "tr"]
+            is_yuk_tr = any(alias in yuk_ulk for alias in turkiye_aliases)
+            is_bos_tr = any(alias in bos_ulk for alias in turkiye_aliases)
+            
+            if not yuk_ulk or yuk_ulk == "null" or not bos_ulk or bos_ulk == "null":
+                parsed_data["is_turu"] = "Belirsiz"
+            elif is_yuk_tr and is_bos_tr:
+                parsed_data["is_turu"] = "Yurtiçi"
+            elif is_yuk_tr and not is_bos_tr:
+                parsed_data["is_turu"] = "İhracat"
+            elif not is_yuk_tr and is_bos_tr:
+                parsed_data["is_turu"] = "İthalat"
+            else:
+                parsed_data["is_turu"] = "Transit"
+                
+        return parsed_list
+
+    except Exception as e:
+        print(f"[HATA - Çoklu Çıkarım]: {e}")
+        return [{"notlar": f"HATA: Beklenmeyen bir istisna oluştu ({str(e)})"}]
+
+def parse_freight_email(email_content: str) -> list:
+    """Verilen e-posta metnini okur ve yapılandırılmış JSON formatında DİCT listesi [{}, {}] döndürür."""
+    prompt = f"""Aşağıdaki e-postadan lojistik bilgilerini çıkar. SADECE JSON döndür.
+
+## ALAN TANIMLARI
+
+| Alan | Açıklama | Örnek Değerler |
+|------|----------|----------------|
+| coklu_secenek_var_mi | E-postada BİRDEN FAZLA TEKLİF/ROTA (ayrı güzergahlar) varsa "Evet", yoksa "Hayır" | "Evet", "Hayır" |
+| romork_cinsi | Araç/ekipman tipi | "Frigo", "Tente", "Mega", "Kapalı Kasa" |
+| yukleme_tipi | Metinde geçen değere göre FTL, LTL, LCL veya parsiyel vb. olduğu gibi yaz. | "FTL", "LTL", "LCL", "Parsiyel" |
+| yukleme_sehri | Yükleme  şehrini yaz. Semt gibi bilgileri dahil etme, yalnızca şehir bilgisini çıkar. | "Milano" |
+| yukleme_ulkesi | Yükleme ülkesi — şehirden çıkar gerekirse | "İtalya" |
+| bosaltma_sehri | Boşaltma  şehrini yaz. Semt gibi bilgileri dahil etme, yalnızca şehir bilgisini çıkar. | "Uralsk" |
+| bosaltma_ulkesi | Boşaltma ülkesi — şehirden çıkar gerekirse | "Kazakistan" |
+| tarih | Yükleme tarihi veya haftası (metin olarak) | "15.07.2025", "W28" |
+| sicaklik_araligi | Taşıma sıcaklığı (orijinal formatta) | "+2 +8", "-18" |
+| adr_sinifi | ADR tehlike sınıfı (yalnızca rakam/kod) | "3", "6.1" |
+| gtip_kodlari | GTİP/HS kodları listesi (string olarak) | ["32091000", "32089091"] |
+| tonaj | Ağırlık bilgisi (birimle birlikte) | "21 ton", "24.500 kg" |
+| notlar | Özel talepler, geçiş kısıtları, ek bilgiler | "Rusya transit" |
+
+## ŞEHİR → ÜLKE ÇIKARIM KURALLARI
+- Şehir açıkça yazılmış ama ülke yoksa, bilinen coğrafyadan ülkeyi çıkar.
+- Emin değilsen null bırak, uydurma.
+- Örnekler: Uralsk → Kazakistan, Brugerio → İtalya, Duisburg → Almanya
+
+### Coğrafi Kod Çözme
+Lokasyon bilgisi şu formatlarda gelebilir — her durumda şehir ve ülkeyi çöz:
+
+| Format | Örnek | Çözüm |
+|--------|-------|-------|
+| ISO Ülke-Posta Kodu | IT-30100 | Şehir: Venedik, Ülke: İtalya |
+| ISO Ülke-Bölge Kodu | FR-49 | Şehir: null, Ülke: Fransa |
+| Sadece ülke kodu | DE, PL, RO | Ülkeye çevir, şehir null |
+| LOCODE | DEHAM | Hamburg, Almanya |
+| Serbest şehir adı | Uralsk | Ülkeyi coğrafyadan çıkar → Kazakistan |
+
+Emin değilsen null bırak, asla uydurma.
+
+## ÖRNEK (One-Shot)
+
+Metin:
+```
+Konu: SB972/ FCA Brugerio (Italy) - Uralsk / FTL +5+10
+
+Merhaba Yağmur hanım,
 FCA Brugerio – Uralsk 
-Frigo +5+10
-ADR – 3 sınıf
+Frigo +5+10 / ADR – 3 sınıf
 GTİP - 32091000, 32089091, 32081090 
-21 ton
-Rusya ile geçebilir 
-Yük hazır
+21 ton / Rusya ile geçebilir / Yük hazır
+```
 
-С уважением / Best regards,
-"
-
-Örnek Çıktı:
+Çıktı:
 {{
+  "coklu_secenek_var_mi": "Hayır",
   "romork_cinsi": "Frigo",
   "yukleme_tipi": "FTL",
   "yukleme_sehri": "Brugerio",
@@ -235,37 +535,38 @@ Yük hazır
   "tarih": null,
   "sicaklik_araligi": "+5 +10",
   "adr_sinifi": "3",
-  "gtip_kodlari": [32091000, 32089091, 32081090],
+  "gtip_kodlari": ["32091000", "32089091", "32081090"],
   "tonaj": "21 ton",
-  "notlar": "Rusya ile geçebilir, Yük hazır"
+  "notlar": "Rusya transit geçiş, yük hazır"
 }}
 
-Şimdi aşağıdaki e-posta içeriği için aynı işlemi gerçekleştir:
+## ŞİMDİ AŞAĞIDAKİ E-POSTADAN BİLGİ ÇIKAR:
+
 {email_content}
 """
-    system_prompt = (
-        "Sen lojistik ve tedarik zinciri alaninda uzmanlasmis, cok dilli (Turkce, Ingilizce, Rusca) "
-        "kidemli bir veri cikarma asistanisin. Gorevin, nakliye e-postalarindan istenen alanlari "
-        "ayiklayip SADECE gecerli bir JSON objesi uretmektir.\n\n"
-        "KESIN KURALLAR:\n"
-        "1. JSON disinda tek kelime yazma (selamlama, aciklama, kod blogu yok).\n"
-        "2. Metinde yoksa uydurma; emin degilsen null değerini kullan.\n"
-        "3. JSON anahtarlarini ASLA degistirme; sadece istenen anahtarlarla cevap ver."
-    )
+    system_prompt = """
+Sen lojistik/nakliye e-postalarından yapılandırılmış JSON çıkaran uzman bir motorusun.
+
+ÇIKTI KURALLARI:
+- YALNIZCA geçerli JSON döndür. Markdown, açıklama, yorum yasak.
+- Bilgi yoksa: null
+- Veri uydurma. Belirsizse null tercih et.
+- JSON anahtar adlarını değiştirme.
+"""
     
     try:
         if LLM_TYPE.lower() == "online":
             api_key = os.getenv("GOOGLE_API_KEY")
             if not api_key:
-                print("ERROR: GOOGLE_API_KEY not found.")
+                print("HATA: GOOGLE_API_KEY bulunamadı.")
                 return None
-            print(f"[*] Analyzing with Google model ({GOOGLE_MODEL}) [ONLINE]...")
+            print(f"[*] Google modeli ({GOOGLE_MODEL}) ile analiz ediliyor [ONLINE]...")
             result_text = parse_with_google(prompt, system_prompt, GOOGLE_MODEL, api_key)
         elif LLM_TYPE.lower() == "offline":
-            print(f"[*] Analyzing with Ollama model ({OLLAMA_MODEL}) [OFFLINE]...")
+            print(f"[*] Ollama modeli ({OLLAMA_MODEL}) ile analiz ediliyor [OFFLINE]...")
             result_text = parse_with_ollama(prompt, system_prompt, OLLAMA_MODEL)
         else:
-            print(f"ERROR: Invalid LLM_TYPE '{LLM_TYPE}'.")
+            print(f"HATA: Geçersiz LLM_TYPE '{LLM_TYPE}'.")
             return None
 
         result_text = result_text.strip()
@@ -274,15 +575,45 @@ Yük hazır
         if result_text.endswith("```"): result_text = result_text[:-3]
         result_text = result_text.strip()
         
-        parsed_data = json.loads(result_text)
+        try:
+            parsed_data = json.loads(result_text)
+            if not isinstance(parsed_data, dict):
+                parsed_data = {}
+        except json.JSONDecodeError:
+            print("HATA: Modelden dönen metin geçerli bir JSON değil.\nMetin:", result_text)
+            parsed_data = {}
+        
+        # Eğer dict tamamen boş ise veya kritik veri parse edilemediyse hata notu düşelim
+        if not parsed_data:
+            parsed_data["notlar"] = "HATA: Otomatik ayrıştırma başarısız oldu veya LLM geçerli bir çıktı veremedi."
+        
+        # --- ÇOKLU TALEP (CONDITIONAL ROUTING) KONTROLÜ ---
+        coklu_mu = str(parsed_data.get("coklu_secenek_var_mi", "Hayır")).strip().lower()
+        if coklu_mu in ["evet", "x", "yes", "true", "1"]:
+            print("\n[BİLGİ] Model e-postada ÇOKLU TALEP tespit etti. İkinci aşama (Çoklu Çıkarım) başlatılıyor...")
+            return extract_multiple_requests(email_content)
+            
+        # Excel'e yazılmadan önce gereksiz anahtarı temizle
+        parsed_data.pop("coklu_secenek_var_mi", None)
         
         # --- KONTROL / POST-PROCESSING ADIMI ---
+        
+        # Nominatim (OpenStreetMap) Geocoding - Şehir/Semt Düzeltme ve Ülke Tespiti
+        yuk_sehir, yuk_ulke = verify_city(parsed_data.get("yukleme_sehri"), parsed_data.get("yukleme_ulkesi"))
+        if yuk_sehir: parsed_data["yukleme_sehri"] = yuk_sehir
+        if yuk_ulke: parsed_data["yukleme_ulkesi"] = yuk_ulke
+            
+        bos_sehir, bos_ulke = verify_city(parsed_data.get("bosaltma_sehri"), parsed_data.get("bosaltma_ulkesi"))
+        if bos_sehir: parsed_data["bosaltma_sehri"] = bos_sehir
+        if bos_ulke: parsed_data["bosaltma_ulkesi"] = bos_ulke
         
         # 1. Römork Cinsi Kontrolü
         # Eğer römork cinsi gelmemişse (null, empty, belirtilmemiş vb.) her zaman 'tente' yap.
         romork_val = parsed_data.get("romork_cinsi")
         if not romork_val or str(romork_val).strip().lower() in ["null", "none", "belirtilmemiş", ""]:
-            parsed_data["romork_cinsi"] = "tenteli"
+            parsed_data["romork_cinsi"] = "Tenteli"
+        elif str(romork_val).strip().lower() in ["tente", "tenteli"]:
+            parsed_data["romork_cinsi"] = "Tenteli"
             
         # 1.1 Intermodal Kontrolü
         romork_cinsi_lower = str(parsed_data.get("romork_cinsi", "")).strip().lower()
@@ -318,36 +649,39 @@ Yük hazır
         else:
             parsed_data["is_turu"] = "Transit"
             
-        return parsed_data
-        
-    except json.JSONDecodeError:
-        print("ERROR: Text returned from model is not a valid JSON.\nText:", result_text)
-        return None
+        return [parsed_data]
+
     except Exception as e:
-        print("An unexpected error occurred:", str(e))
-        return None
+        print("Beklenmeyen bir hata oluştu:", str(e))
+        return [{
+            "notlar": f"HATA: Beklenmeyen bir istisna oluştu ({str(e)})",
+            "romork_cinsi": "tenteli",
+            "is_turu": "Belirsiz",
+            "intermodal": "Hayır",
+            "yukleme_tipi": "Belirsiz"
+        }]
 
 
 # ==========================================
-# DATABASE (MSSQL) FUNCTIONS
+# VERİTABANI (MSSQL) FONKSİYONLARI
 # ==========================================
 
 def get_connection(db=None):
-    """Provides MSSQL connection."""
+    """MSSQL bağlantısı sağlar."""
     conn_str = f"DRIVER={{SQL Server}};SERVER={SERVER_NAME};Trusted_Connection=yes;"
     if db:
         conn_str += f"DATABASE={db};"
     return pyodbc.connect(conn_str)
 
 def init_db():
-    """Creates database and tables."""
+    """Veritabanını ve tablolarını oluşturur."""
     conn = get_connection()
     conn.autocommit = True
     cursor = conn.cursor()
     cursor.execute(f"SELECT DB_ID('{DB_NAME}')")
     if not cursor.fetchone()[0]:
         cursor.execute(f"CREATE DATABASE {DB_NAME}")
-        print(f"[{DB_NAME}] Database successfully created on MSSQL.")
+        print(f"[{DB_NAME}] Veritabanı MSSQL üzerinde başarıyla oluşturuldu.")
     cursor.close()
     conn.close()
 
@@ -394,7 +728,7 @@ def init_db():
     conn_db.close()
 
 def get_trailer_id(trailer_name: str):
-    """Fetches Trailer ID from database by name."""
+    """Treyler ismine göre Veritabanından Treyler ID'sini getirir."""
     if not trailer_name or trailer_name.strip().lower() in ["belirtilmemiş", "not specified", "null"]:
         return None
     conn = get_connection(DB_NAME)
@@ -405,7 +739,7 @@ def get_trailer_id(trailer_name: str):
     return row[0] if row else None
 
 def insert_freight_request(parsed_data: dict):
-    """Saves parsed LLM data to MSSQL."""
+    """Ayrıştırılmış (LLM) verilerini MSSQL'e kaydeder."""
     if not parsed_data:
         return
 
@@ -440,4 +774,4 @@ def insert_freight_request(parsed_data: dict):
     conn.commit()
     conn.close()
     
-    print(f"[*] Request successfully added to MSSQL database! (Request ID: {inserted_id}, Trailer ID: {trailer_id})")
+    print(f"[*] Talep MSSQL veritabanına başarıyla eklendi! (Talep ID: {inserted_id}, Treyler ID: {trailer_id})")
