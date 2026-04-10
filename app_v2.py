@@ -49,20 +49,24 @@ def process_new_emails():
             
             for msg in messages:
                 try:
-                    body = msg.Body
-                    if not body or not body.strip():
+                    msg_body = msg.Body
+                    if not msg_body or not msg_body.strip():
                         msg.UnRead = False
                         msg.Save()
                         continue
                         
+                    # Konu başlığını gövdenin en başına ekle (LLM daha iyi anlasın diye)
+                    subject = getattr(msg, 'Subject', 'Konusuz')
+                    body = f"Konu: {subject}\n\n{msg_body}"
+                        
                     # Metin temizleme ve imza ayırma
                     cleaned_content = clean_email_body(body)
                     
-                    # Modeli çağır ve ayrıştır
-                    parsed_data = parse_freight_email(cleaned_content)
+                    # Modeli çağır ve ayrıştır (Koşullu Yönlendirme - Liste döner)
+                    parsed_data_list = parse_freight_email(cleaned_content)
                     
                     # Eğer ayrıştırma başarılı olduysa, gönderici bilgilerini ekle
-                    if parsed_data is not None:
+                    if parsed_data_list and isinstance(parsed_data_list, list):
                         sender_name = getattr(msg, 'SenderName', 'Bilinmeyen Gönderici')
                         sender_email = getattr(msg, 'SenderEmailAddress', '')
                         
@@ -81,11 +85,14 @@ def process_new_emails():
                             company_name = domain_part.split('.')[0]           # stantelogistics
                             company_name = company_name.capitalize()           # Stantelogistics
                             
-                        parsed_data['Musteri'] = company_name
-                        parsed_data['Mail Gonderen'] = sender_name
-                    
-                    # Excel'e logla
-                    log_to_excel(body, parsed_data)
+                        # Bölünmüş her bir talep için Excel'e yaz:
+                        for parsed_data in parsed_data_list:
+                            parsed_data['Musteri'] = company_name
+                            parsed_data['Mail Gonderen'] = sender_name
+                            parsed_data['Mail Konusu'] = subject
+                            
+                            # Excel'e logla
+                            log_to_excel(body, parsed_data)
                     
                     # Mail başarıyla işlendiği için okundu olarak işaretle
                     msg.UnRead = False
